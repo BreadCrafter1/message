@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>terminal chat</title>
+<style>
+:root{--bg:#020a04;--fg:#33ff66;--dim:#1f9940;--bad:#ff5f5f;--me:#b6ffc9;box-sizing:border-box}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#020a04;--fg:#33ff66}}
+:root[data-theme="dark"]{--bg:#020a04;--fg:#33ff66}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font-family:'Courier New',Courier,monospace;font-size:1rem;line-height:1.5;padding:env(safe-area-inset-top,0px) 16px env(safe-area-inset-bottom,0px)}
+#app{height:100%;display:flex;flex-direction:column;max-width:760px;margin:0 auto;padding:14px 0}
+#log{flex:1;overflow-y:auto;white-space:pre-wrap;word-break:break-word}
+.dim{color:var(--dim)}.bad{color:var(--bad)}.me{color:var(--me)}
+form{display:flex;gap:.5rem;align-items:center;padding-top:10px;border-top:1px solid var(--dim)}
+label{color:var(--dim);white-space:nowrap}
+input{flex:1;min-width:0;font:inherit;font-size:16px;background:transparent;border:0;color:var(--fg);outline:0;padding:4px 0;caret-color:var(--fg)}
+input:focus-visible{outline:0}
+form:focus-within{border-top-color:var(--fg)}
+#chat{display:none}
+.in #chat{display:flex}.in #login{display:none}
+#login{display:flex;flex-direction:column}
+button{font:inherit;font-size:14px;background:transparent;color:var(--fg);border:1px solid var(--dim);padding:2px 8px;cursor:pointer}
+button:focus-visible{outline:2px solid var(--fg)}
+#log img{display:block;max-width:100%;max-height:320px;margin:4px 0;border:1px solid var(--dim)}
+</style>
+</head>
+<body>
+<div id="app">
+ <div id="login">
+  <div id="lmsg">$ login<br><span class="dim">enter password to continue.</span></div>
+  <form id="lf"><label for="pw">password:</label><input id="pw" type="password" autocomplete="off" autocapitalize="off" autofocus></form>
+ </div>
+ <div id="chat" style="flex-direction:column;height:100%">
+  <div id="log" role="log" aria-live="polite"></div>
+  <form id="cf"><label id="prompt" for="msg">&gt;</label><input id="msg" type="text" autocomplete="off" autocapitalize="off" maxlength="500" enterkeyhint="send" aria-label="Message"><button type="submit" id="snd">[send]</button><button type="button" id="att" aria-label="Attach image">[img]</button><input type="file" id="file" accept="image/*" hidden></form>
+ </div>
+</div>
+<script>
+(function(){
+ var SALT="baFKjP+cjbOG8Xryf+/Izw==",ITER=300000,VER="DMlT+t2vcJ3DDliu/9DOKy6RlAbqF2ucMnMsjO9E",HOST="https://ntfy.sh/";
+ var app=document.getElementById('app'),log=document.getElementById('log'),prompt_=document.getElementById('prompt');
+ var enc=function(s){return new TextEncoder().encode(s)},dec=function(b){return new TextDecoder().decode(b)};
+ var u8=function(s){return Uint8Array.from(atob(s),function(c){return c.charCodeAt(0)})};
+ var b64=function(a){var s='';a.forEach(function(x){s+=String.fromCharCode(x)});return btoa(s)};
+ var hex=function(a){return Array.prototype.map.call(a,function(x){return ('0'+x.toString(16)).slice(-2)}).join('')};
+ var key,topic,nick='',needNick=false,seen={},es=null;
+ try{nick=localStorage.getItem('nick')||'';}catch(e){}
+
+ function line(txt,cls){var d=document.createElement('div');if(cls)d.className=cls;d.textContent=txt;log.appendChild(d);log.scrollTop=log.scrollHeight;}
+ function setPrompt(){prompt_.textContent=(needNick?'nickname':nick)+' >';}
+ function clean(n){return n.replace(/[^A-Za-z0-9_-]/g,'').slice(0,16);}
+
+ async function derive(pw){
+  var base=await crypto.subtle.importKey('raw',enc(pw),'PBKDF2',false,['deriveBits']);
+  var bits=new Uint8Array(await crypto.subtle.deriveBits({name:'PBKDF2',salt:u8(SALT),iterations:ITER,hash:'SHA-256'},base,384));
+  return {k:await crypto.subtle.importKey('raw',bits.slice(0,32),'AES-GCM',false,['encrypt','decrypt']),topic:'t'+hex(bits.slice(32))};
+ }
+ async function decrypt(k,s){var d=u8(s);return dec(await crypto.subtle.decrypt({name:'AES-GCM',iv:d.slice(0,12)},k,d.slice(12)));}
+ async function encrypt(k,t){var iv=crypto.getRandomValues(new Uint8Array(12));var ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv:iv},k,enc(t)));var o=new Uint8Array(12+ct.length);o.set(iv);o.set(ct,12);return b64(o);}
+
+ function connect(){
+  es=new EventSource(HOST+topic+'/sse?since=12h');
+  es.onopen=function(){if(!connect.up){line('connected. type /help for commands.','dim');connect.up=true;}};
+  es.onerror=function(){if(connect.up){line('connection lost. reconnecting...','bad');connect.up=false;}};
+  es.onmessage=async function(e){
+   try{
+    var m=JSON.parse(e.data);
+    if(m.event!=='message'||seen[m.id])return;
+    seen[m.id]=1;
+    var p=JSON.parse(await decrypt(key,m.message));
+    if(p.d!==undefined){gotChunk(p);return;}
+    var t=new Date(p.ts).toTimeString().slice(0,5);
+    line('['+t+'] '+String(p.n).slice(0,16)+': '+String(p.t).slice(0,500),p.n===nick?'me':'');
+   }catch(err){}
+  };
+ }
+
+var imgs={};
+ function gotChunk(p){
+  var id=String(p.i).slice(0,24),c=p.c|0,k=p.k|0;
+  if(c<1||c>40||k<0||k>=c||typeof p.d!=='string')return;
+  var e=imgs[id]||(imgs[id]={parts:[],n:0,done:false});
+  if(e.done||e.parts[k]!==undefined)return;
+  e.parts[k]=p.d;e.n++;
+  if(e.n!==c)return;
+  e.done=true;
+  var data=e.parts.join('');
+  if(!/^[A-Za-z0-9+\/=]+$/.test(data))return;
+  var t=new Date(p.ts).toTimeString().slice(0,5);
+  var d=document.createElement('div');if(p.n===nick)d.className='me';
+  d.textContent='['+t+'] '+String(p.n).slice(0,16)+':';
+  var im=document.createElement('img');im.alt='image';
+  im.onload=function(){log.scrollTop=log.scrollHeight;};
+  im.src='data:image/jpeg;base64,'+data;
+  d.appendChild(im);log.appendChild(d);log.scrollTop=log.scrollHeight;
+ }
+ async function sendImage(file){
+  if(!file||!/^image\//.test(file.type)){line('not an image.','bad');return;}
+  line('compressing image...','dim');
+  try{
+   var url=URL.createObjectURL(file);
+   var im=await new Promise(function(res,rej){var i=new Image();i.onload=function(){res(i)};i.onerror=rej;i.src=url;});
+   URL.revokeObjectURL(url);
+   var scale=Math.min(1,640/Math.max(im.width,im.height)),q=0.7,data='';
+   for(var tries=0;tries<14;tries++){
+    var cv=document.createElement('canvas');
+    cv.width=Math.max(1,Math.round(im.width*scale));cv.height=Math.max(1,Math.round(im.height*scale));
+    cv.getContext('2d').drawImage(im,0,0,cv.width,cv.height);
+    data=cv.toDataURL('image/jpeg',q).split(',')[1];
+    if(data.length<=45000)break;
+    if(q>0.35)q-=0.1;else scale*=0.8;
+   }
+   if(data.length>45000){line('image too large.','bad');return;}
+   var id=hex(crypto.getRandomValues(new Uint8Array(6))),size=2700,c=Math.ceil(data.length/size),ts=Date.now();
+   line('sending image ('+c+' parts)...','dim');
+   for(var k=0;k<c;k++){
+    var body=await encrypt(key,JSON.stringify({n:nick,ts:ts,i:id,k:k,c:c,d:data.slice(k*size,(k+1)*size)}));
+    var r=await fetch(HOST+topic,{method:'POST',body:body});
+    if(!r.ok)throw new Error(r.status);
+   }
+  }catch(err){line('image failed to send. try again.','bad');}
+ }
+ async function send(text){
+  try{
+   var body=await encrypt(key,JSON.stringify({n:nick,t:text,ts:Date.now()}));
+   var r=await fetch(HOST+topic,{method:'POST',body:body});
+   if(!r.ok)throw new Error(r.status);
+  }catch(err){line('message failed to send. try again.','bad');}
+ }
+
+ var fileEl=document.getElementById('file');
+ document.getElementById('att').addEventListener('click',function(){
+  if(needNick){line('choose a nickname first.','bad');return;}
+  fileEl.click();
+ });
+ fileEl.addEventListener('change',function(){
+  var f=fileEl.files[0];fileEl.value='';
+  if(needNick){line('choose a nickname first.','bad');return;}
+  sendImage(f);
+ });
+
+ document.getElementById('lf').addEventListener('submit',async function(ev){
+  ev.preventDefault();
+  var inp=document.getElementById('pw'),pw=inp.value.trim().toLowerCase();inp.value='';
+  var lm=document.getElementById('lmsg');
+  try{
+   var d=await derive(pw);
+   if(await decrypt(d.k,VER)!=='ok')throw 0;
+   key=d.k;topic=d.topic;
+   app.classList.add('in');
+   line('access granted.','dim');
+   if(nick){setPrompt();line('you are '+nick+'. connecting...','dim');connect();}
+   else{needNick=true;setPrompt();line('choose a nickname (letters, numbers, - or _; 2-16 chars).','dim');line('it is permanent on this device and cannot be changed.','dim');}
+   document.getElementById('msg').focus();
+  }catch(err){lm.innerHTML='$ login<br><span class="bad">access denied.</span> <span class="dim">try again.</span>';}
+ });
+
+ document.getElementById('cf').addEventListener('submit',function(ev){
+  ev.preventDefault();
+  var inp=document.getElementById('msg'),t=inp.value.trim();inp.value='';
+  if(!t)return;
+  if(needNick){
+   var n=clean(t);
+   if(n.length<2){line('invalid nickname. use 2-16 letters, numbers, - or _.','bad');return;}
+   nick=n;needNick=false;try{localStorage.setItem('nick',n)}catch(e){}
+   setPrompt();line('you are '+n+'. connecting...','dim');connect();return;
+  }
+  if(t[0]==='/'){
+   var parts=t.split(/\s+/),c=parts[0].toLowerCase();
+   if(c==='/clear'){log.textContent='';}
+   else if(c==='/exit'){location.reload();}
+   else if(c==='/img'){document.getElementById('file').click();}
+   else if(c==='/help'){line('/img        send a picture','dim');line('/clear      clear the screen','dim');line('/exit       lock and leave','dim');}
+   else line('unknown command. try /help','bad');
+   return;
+  }
+  send(t);
+ });
+})();
+</script>
+</body>
+</html>
