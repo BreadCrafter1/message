@@ -41,6 +41,10 @@ button:focus-visible{outline:2px solid var(--fg)}
 #log a{color:var(--fg)}
 #rec{color:var(--bad);border-color:var(--bad)}
 .hq{font-size:12px}
+#dbgbtn{position:fixed;top:env(safe-area-inset-top,0px);right:0;width:52px;height:52px;opacity:0;border:0;padding:0;background:transparent;z-index:50}
+#dbg{display:none;position:fixed;inset:0;background:#000;z-index:60;overflow:auto;padding:14px}
+#dbg.on{display:block}
+#dbgt{white-space:pre-wrap;word-break:break-word;margin:10px 0}
 </style>
 </head>
 <body>
@@ -58,6 +62,8 @@ button:focus-visible{outline:2px solid var(--fg)}
   <form id="cf"><label id="prompt" for="msg">&gt;</label><input id="msg" type="text" autocomplete="off" autocapitalize="off" maxlength="500" enterkeyhint="send" aria-label="Message"><button type="submit" id="snd">[send]</button><input type="file" id="file" hidden></form>
  </div>
 </div>
+<button type="button" id="dbgbtn" aria-label="debug" tabindex="-1"></button>
+<div id="dbg"><div class="dim">-- debug --</div><pre id="dbgt"></pre><button type="button" id="dbgw">[wipe all messages]</button> <button type="button" id="dbgx">[close]</button></div>
 <script>
 /* PASTE THE SEALED STRING FROM THE APP'S "/github seal" BETWEEN THE QUOTES (turns on the permanent GitHub history): */
 var GH_SEAL="9t44aGTzzLiLZ7YXm34T/QsQJ/HVdHU/6uJRBUJ2Lo/N+UyZQsrGUbJtIyI39Xm7Dk4FdYz6xeBrY2j1aVcqI1dx7RIubVq2BrWFwP3Jdiru0K1/MdgwRjf54j2SgC+XaMzzT/VnHIc=";
@@ -70,10 +76,11 @@ var GH_SEAL="9t44aGTzzLiLZ7YXm34T/QsQJ/HVdHU/6uJRBUJ2Lo/N+UyZQsrGUbJtIyI39Xm7Dk4
  var u8=function(s){return Uint8Array.from(atob(s),function(c){return c.charCodeAt(0)})};
  var b64=function(a){var s='';a.forEach(function(x){s+=String.fromCharCode(x)});return btoa(s)};
  var hex=function(a){return Array.prototype.map.call(a,function(x){return ('0'+x.toString(16)).slice(-2)}).join('')};
- var key,topic,nick='',needNick=false,seen={},es=null;
+ var key,topic,nick='',needNick=false,seen={},es=null,dbgErr=[],wipedAt=0;
+ try{wipedAt=+localStorage.getItem('wiped')||0;}catch(e){}
  try{nick=localStorage.getItem('nick')||'';}catch(e){}
 
- function line(txt,cls){var d=document.createElement('div');if(cls)d.className=cls;d.textContent=txt;log.appendChild(d);log.scrollTop=log.scrollHeight;}
+ function line(txt,cls){if(cls==='bad'){dbgErr.push(new Date().toTimeString().slice(0,8)+' '+txt);if(dbgErr.length>10)dbgErr.shift();}var d=document.createElement('div');if(cls)d.className=cls;d.textContent=txt;log.appendChild(d);log.scrollTop=log.scrollHeight;}
  function setPrompt(){prompt_.textContent=(needNick?'nickname':nick)+' >';}
  function clean(n){return n.replace(/[^A-Za-z0-9_-]/g,'').slice(0,16);}
 
@@ -161,7 +168,7 @@ var GH_SEAL="9t44aGTzzLiLZ7YXm34T/QsQJ/HVdHU/6uJRBUJ2Lo/N+UyZQsrGUbJtIyI39Xm7Dk4
   }catch(e){}
   quiet=false;
  }
- function showText(p){var t=new Date(p.ts).toTimeString().slice(0,5);line('['+t+'] '+p.n+': '+p.t,p.n===nick?'me':'');}
+ function showText(p){if(p.ts<=wipedAt)return;var t=new Date(p.ts).toTimeString().slice(0,5);line('['+t+'] '+p.n+': '+p.t,p.n===nick?'me':'');}
  function connect(){ghSync().then(loadSaved).then(startES,startES);}
  function startES(){
   es=new EventSource(HOST+topic+'/sse?since='+(HOST===DEF?'12h':'all'));
@@ -229,6 +236,7 @@ var imgs={},MAXF=121500,SZ=2700;
   }catch(e){}
  }
  function render(p,bin){
+  if(p.ts<=wipedAt)return;
   var kind=p.kd||'img',mime=String(p.m||'image/jpeg').slice(0,80);
   if(kind==='img'&&!/^image\/(jpeg|png|webp|gif)$/.test(mime))mime='image/jpeg';
   if(kind==='vm'&&!/^audio\//.test(mime))return;
@@ -700,6 +708,37 @@ var imgs={},MAXF=121500,SZ=2700;
    return;
   }
   send(t);
+ });
+
+ var dbgEl=document.getElementById('dbg'),dbgT=document.getElementById('dbgt'),wbtn=document.getElementById('dbgw'),armed=0;
+ async function dbgShow(){
+  var all=[],per='?';
+  try{all=await dbAll();}catch(e){}
+  try{per=String(await navigator.storage.persisted());}catch(e){}
+  var tx=all.filter(function(v){return v&&v.txt;}).length,pt=all.filter(function(v){return v&&v.part;}).length;
+  dbgT.textContent=['relay: '+HOST,
+   'github: '+(gh?'on ('+gh.r+', branch history)':(GH_SEAL?'sealed token set, not unlocked (log in first)':'off')),
+   'saved on this device: '+tx+' messages, '+(all.length-tx-pt)+' attachments',
+   'on screen: '+Object.keys(shown).length,'nickname: '+(nick||'-'),'logged in: '+(!!key),
+   'call: '+(call?call.state:'none'),'https: '+isSecureContext,'browser keeps storage: '+per,
+   'wiped at: '+(wipedAt?new Date(wipedAt).toLocaleString():'never'),'','recent errors:'].concat(dbgErr.length?dbgErr:['(none)']).join('\n');
+ }
+ document.getElementById('dbgbtn').addEventListener('click',function(){dbgEl.classList.add('on');dbgShow();});
+ document.getElementById('dbgx').addEventListener('click',function(){dbgEl.classList.remove('on');});
+ wbtn.addEventListener('click',async function(){
+  if(!armed){armed=1;wbtn.textContent='[tap again within 5 s to DELETE everything]';setTimeout(function(){armed=0;wbtn.textContent='[wipe all messages]';},5000);return;}
+  armed=0;wbtn.textContent='[wiping...]';
+  try{
+   wipedAt=Date.now();localStorage.setItem('wiped',String(wipedAt));
+   var d=await db();
+   await new Promise(function(res,rej){var t=d.transaction('a','readwrite');t.objectStore('a').clear();t.oncomplete=res;t.onerror=function(){rej(t.error);};});
+   var gm='';
+   if(gh){var r=await fetch('https://api.github.com/repos/'+gh.r+'/git/refs/heads/history',{method:'DELETE',headers:ghH()});gm=(r.ok||r.status===404||r.status===422)?' github history deleted.':' github delete failed ('+r.status+').';await ghBranch();}
+   else if(GH_SEAL)gm=' (log in first to also delete the github history.)';
+   log.textContent='';shown={};grp={};
+   line('all messages wiped from this device.'+gm,'dim');
+  }catch(e){line('wipe failed: '+(e&&e.message||e),'bad');}
+  wbtn.textContent='[wipe all messages]';dbgShow();
  });
 })();
 </script>
